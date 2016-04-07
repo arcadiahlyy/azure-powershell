@@ -23,9 +23,8 @@ using System.Threading.Tasks;
 using Hyak.Common;
 using Microsoft.Azure.Commands.Resources.Models.Authorization;
 using Microsoft.Azure.Commands.ResourceManager.Cmdlets.Components;
+using Microsoft.Azure.Commands.ResourceManager.Cmdlets.Utilities;
 using Microsoft.Azure.Commands.Tags.Model;
-using Microsoft.Azure.Common.Authentication;
-using Microsoft.Azure.Common.Authentication.Models;
 using Microsoft.Azure.Management.Authorization;
 using Microsoft.Azure.Management.Authorization.Models;
 using Microsoft.Azure.Management.Resources;
@@ -34,6 +33,9 @@ using Microsoft.WindowsAzure.Commands.Common;
 using Microsoft.WindowsAzure.Commands.Utilities.Common;
 using Newtonsoft.Json;
 using ProjectResources = Microsoft.Azure.Commands.Resources.Properties.Resources;
+using System.Net;
+using Microsoft.Azure.Commands.Common.Authentication;
+using Microsoft.Azure.Commands.Common.Authentication.Models;
 
 namespace Microsoft.Azure.Commands.Resources.Models
 {
@@ -205,7 +207,7 @@ namespace Microsoft.Azure.Commands.Resources.Models
             }
         }
 
-        private DeploymentExtended ProvisionDeploymentStatus(string resourceGroup, string deploymentName, Deployment deployment)
+        public DeploymentExtended ProvisionDeploymentStatus(string resourceGroup, string deploymentName, Deployment deployment)
         {
             operations = new List<DeploymentOperation>();
 
@@ -243,23 +245,33 @@ namespace Microsoft.Azure.Commands.Resources.Models
 
                 if (operation.Properties.ProvisioningState != ProvisioningState.Failed)
                 {
-                    statusMessage = string.Format(normalStatusFormat,
+                    if (operation.Properties.TargetResource != null)
+                    {
+                        statusMessage = string.Format(normalStatusFormat,
                         operation.Properties.TargetResource.ResourceType,
                         operation.Properties.TargetResource.ResourceName,
                         operation.Properties.ProvisioningState.ToLower());
 
-                    WriteVerbose(statusMessage);
+                        WriteVerbose(statusMessage);
+                    }
                 }
                 else
                 {
                     string errorMessage = ParseErrorMessage(operation.Properties.StatusMessage);
 
-                    statusMessage = string.Format(failureStatusFormat,
+                    if(operation.Properties.TargetResource != null)
+                    {
+                        statusMessage = string.Format(failureStatusFormat,
                         operation.Properties.TargetResource.ResourceType,
                         operation.Properties.TargetResource.ResourceName,
                         errorMessage);
 
-                    WriteError(statusMessage);
+                        WriteError(statusMessage);
+                    }
+                    else
+                    {
+                        WriteError(errorMessage);
+                    }
 
                     List<string> detailedMessage = ParseDetailErrorMessage(operation.Properties.StatusMessage);
 
@@ -319,7 +331,7 @@ namespace Microsoft.Azure.Commands.Resources.Models
                 }
 
                 deployment = ResourceManagementClient.Deployments.Get(resourceGroup, deploymentName).Deployment;
-                Thread.Sleep(2000);
+                TestMockSupport.Delay(10000);
 
             } while (!status.Any(s => s.Equals(deployment.Properties.ProvisioningState, StringComparison.OrdinalIgnoreCase)));
 
@@ -338,25 +350,39 @@ namespace Microsoft.Azure.Commands.Resources.Models
                 }
 
                 //If nested deployment, get the operations under those deployments as well
-                if(operation.Properties.TargetResource.ResourceType.Equals(Constants.MicrosoftResourcesDeploymentType, StringComparison.OrdinalIgnoreCase))
+                if(operation.Properties.TargetResource != null && operation.Properties.TargetResource.ResourceType.Equals(Constants.MicrosoftResourcesDeploymentType, StringComparison.OrdinalIgnoreCase))
                 {
-                    List<DeploymentOperation> newNestedOperations = new List<DeploymentOperation>();
-                    DeploymentOperationsListResult result;
+                    HttpStatusCode statusCode;
+                    Enum.TryParse<HttpStatusCode>(operation.Properties.StatusCode, out statusCode);
+                    if(!statusCode.IsClientFailureRequest())
+                    {
+                        List<DeploymentOperation> newNestedOperations = new List<DeploymentOperation>();
+                        DeploymentOperationsListResult result;
 
-                    result = ResourceManagementClient.DeploymentOperations.List(
-                        resourceGroupName: ResourceIdUtility.GetResourceGroupName(operation.Properties.TargetResource.Id),
-                        deploymentName: operation.Properties.TargetResource.ResourceName,
-                        parameters: null);
+                        result = ResourceManagementClient.DeploymentOperations.List(
+                            resourceGroupName: ResourceIdUtility.GetResourceGroupName(operation.Properties.TargetResource.Id),
+                            deploymentName: operation.Properties.TargetResource.ResourceName,
+                            parameters: null);
 
-                    newNestedOperations = GetNewOperations(operations, result.Operations);
-                    newOperations.AddRange(newNestedOperations);
+                        newNestedOperations = GetNewOperations(operations, result.Operations);
+
+                        foreach (DeploymentOperation op in newNestedOperations)
+                        {
+                            DeploymentOperation nestedOperationWithSameIdAndProvisioningState = newOperations.Find(o => o.OperationId.Equals(op.OperationId) && o.Properties.ProvisioningState.Equals(op.Properties.ProvisioningState));
+
+                            if (nestedOperationWithSameIdAndProvisioningState == null)
+                            {
+                                newOperations.Add(op);
+                            }
+                        }
+                    }
                 }
             }
 
             return newOperations;
         }
 
-        private Deployment CreateBasicDeployment(ValidatePSResourceGroupDeploymentParameters parameters, DeploymentMode deploymentMode)
+        private Deployment CreateBasicDeployment(ValidatePSResourceGroupDeploymentParameters parameters, DeploymentMode deploymentMode, string debugSetting)
         {
             Deployment deployment = new Deployment
             {
@@ -365,18 +391,19 @@ namespace Microsoft.Azure.Commands.Resources.Models
                 }
             };
 
+            if(!string.IsNullOrEmpty(debugSetting))
+            {
+                deployment.Properties.DebugSetting = new DeploymentDebugSetting
+                {
+                    DeploymentDebugDetailLevel = debugSetting
+                };
+            }
+
             if (Uri.IsWellFormedUriString(parameters.TemplateFile, UriKind.Absolute))
             {
                 deployment.Properties.TemplateLink = new TemplateLink
                 {
                     Uri = new Uri(parameters.TemplateFile)
-                };
-            }
-            else if (!string.IsNullOrEmpty(parameters.GalleryTemplateIdentity))
-            {
-                deployment.Properties.TemplateLink = new TemplateLink
-                {
-                    Uri = new Uri(GalleryTemplatesClient.GetGalleryTemplateFile(parameters.GalleryTemplateIdentity))
                 };
             }
             else
